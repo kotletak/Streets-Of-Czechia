@@ -33,9 +33,11 @@ ROBLOX_GROUP_ID = os.getenv("ROBLOX_GROUP_ID")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 CREDENTIALS_FILE = os.getenv("CREDENTIALS_FILE", "credentials.json")
 
-# Volitelné ID kanálu (převede se na číslo, pokud je vyplněné)
 raw_channel_id = os.getenv("UPLOAD_CHANNEL_ID", "").strip()
 UPLOAD_CHANNEL_ID = int(raw_channel_id) if raw_channel_id.isdigit() else None
+
+raw_admin_role_id = os.getenv("ADMIN_ROLE_ID", "").strip()
+ADMIN_ROLE_ID = int(raw_admin_role_id) if raw_admin_role_id.isdigit() else None
 
 MAX_FILE_SIZE_MB = float(os.getenv("MAX_FILE_SIZE_MB", "19.5"))
 
@@ -257,6 +259,9 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    if ADMIN_ROLE_ID and not any(r.id == ADMIN_ROLE_ID for r in getattr(message.author, "roles", [])):
+        return
+
     if UPLOAD_CHANNEL_ID and message.channel.id != UPLOAD_CHANNEL_ID:
         return
 
@@ -295,6 +300,9 @@ async def on_message(message: discord.Message):
     mp3="Mp3: Přiložený .mp3 soubor"
 )
 async def upload_slash(interaction: discord.Interaction, name: str, team: str, mp3: discord.Attachment):
+    if ADMIN_ROLE_ID and not any(r.id == ADMIN_ROLE_ID for r in getattr(interaction.user, "roles", [])):
+        await interaction.response.send_message("❌ Nemáš oprávnění používat tento příkaz.", ephemeral=True)
+        return
     await interaction.response.defer(thinking=True)
     try:
         embed = await process_upload(mp3, name, team, interaction.user)
