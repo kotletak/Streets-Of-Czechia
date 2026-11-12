@@ -9,9 +9,6 @@ from discord import app_commands
 import gspread
 from dotenv import load_dotenv
 
-# ==========================================
-# LOGGING
-# ==========================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -22,9 +19,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AudioBot")
 
-# ==========================================
-# NAČTENÍ .ENV KONFIGURACE
-# ==========================================
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -39,13 +33,14 @@ UPLOAD_CHANNEL_ID = int(raw_channel_id) if raw_channel_id.isdigit() else None
 raw_admin_role_id = os.getenv("ADMIN_ROLE_ID", "").strip()
 ADMIN_ROLE_ID = int(raw_admin_role_id) if raw_admin_role_id.isdigit() else None
 
+raw_ultras_role_id = os.getenv("ULTRAS_LEADER_ROLE_ID", "").strip()
+ULTRAS_LEADER_ROLE_ID = int(raw_ultras_role_id) if raw_ultras_role_id.isdigit() else None
+
 MAX_FILE_SIZE_MB = float(os.getenv("MAX_FILE_SIZE_MB", "19.5"))
 
-# Počet pokusů na polling operation statusu a prodleva mezi nimi
 OPERATION_POLL_ATTEMPTS = int(os.getenv("OPERATION_POLL_ATTEMPTS", "20"))
 OPERATION_POLL_INTERVAL = float(os.getenv("OPERATION_POLL_INTERVAL", "3"))
 
-# Kontrola povinných proměnných při startu
 missing_vars = [
     var_name for var_name, val in [
         ("DISCORD_TOKEN", DISCORD_TOKEN),
@@ -59,15 +54,10 @@ if missing_vars:
     raise RuntimeError(f"❌ V souboru .env chybí tyto povinné proměnné: {', '.join(missing_vars)}")
 
 
-# ==========================================
-# GOOGLE SHEETS FUNKCE
-# ==========================================
 def log_to_sheets_sync(team_name: str, audio_name: str, asset_id: str, uploader: str) -> str:
-    """Synchronní funkce pro gspread - najde nebo vytvoří list týmu a zapíše záznam."""
     gc = gspread.service_account(filename=CREDENTIALS_FILE)
     sh = gc.open_by_key(SPREADSHEET_ID)
 
-    # Očištění názvu týmu pro Google Sheets (nesmí obsahovat * ? : / \ [ ])
     safe_team_name = re.sub(r'[\*\?\:\/\\\[\]]', '', team_name).strip()[:99]
     if not safe_team_name:
         safe_team_name = "Nezarazeno"
@@ -89,13 +79,9 @@ def log_to_sheets_sync(team_name: str, audio_name: str, asset_id: str, uploader:
 
 
 async def log_to_sheets(team_name: str, audio_name: str, asset_id: str, uploader: str) -> str:
-    """Spustí zápis do Google Sheets v samostatném vlákně, aby neblokoval Discord bota."""
     return await asyncio.to_thread(log_to_sheets_sync, team_name, audio_name, asset_id, uploader)
 
 
-# ==========================================
-# ROBLOX OPEN CLOUD UPLOAD FUNKCE
-# ==========================================
 async def upload_mp3_to_roblox(
     file_bytes: bytes,
     filename: str,
@@ -103,11 +89,8 @@ async def upload_mp3_to_roblox(
     team_name: str,
     uploader: str,
 ) -> dict:
-    """Nahraje MP3 na Roblox Group přes Open Cloud Assets API v1 a počká na Asset ID."""
     url = "https://apis.roblox.com/assets/v1/assets"
-    headers = {
-        "x-api-key": ROBLOX_API_KEY
-    }
+    headers = {"x-api-key": ROBLOX_API_KEY}
 
     display_name = f"[{team_name}] {audio_name}"[:50]
     description = f"Name: {audio_name}\nTeam: {team_name}\nNahrál: {uploader}"[:1000]
@@ -127,7 +110,6 @@ async def upload_mp3_to_roblox(
     form.add_field("request", json.dumps(request_payload), content_type="application/json")
     form.add_field("fileContent", file_bytes, filename=filename, content_type="audio/mpeg")
 
-    # Jediná sdílená ClientSession pro celý životní cyklus bota
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers=headers, data=form) as response:
             resp_text = await response.text()
@@ -135,13 +117,10 @@ async def upload_mp3_to_roblox(
                 raise Exception(f"HTTP {response.status}: {resp_text}")
             operation_data = json.loads(resp_text)
 
-        # Pokud je operace hned hotová nebo nemá path, vrátíme výsledek
         operation_path = operation_data.get("path")
         if not operation_path or operation_data.get("done"):
             return operation_data
 
-        # Polling na dokončení asynchronní operace
-        # operation_path může být "operations/xyz" – base URL je jiná
         op_url = f"https://apis.roblox.com/assets/v1/{operation_path}"
         logger.info("Polling operace: %s", op_url)
 
@@ -156,80 +135,33 @@ async def upload_mp3_to_roblox(
                 else:
                     logger.warning("Polling vrátil HTTP %d (pokus %d)", op_resp.status, attempt + 1)
 
-        logger.warning("Operace nebyla dokončena po %d pokusech, vracím poslední data.", OPERATION_POLL_ATTEMPTS)
-        return operation_data
-
-
-# ==========================================
-# DISCORD BOT A ZPRACOVÁNÍ ŠABLONY
-# ==========================================
-class AudioBot(discord.Client):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
-
-    async def setup_hook(self):
-        await self.tree.sync()
-        logger.info("Slash příkazy byly synchronizovány.")
-
-
-client = AudioBot()
-
-
-def parse_template(content: str):
-    """Přečte zprávu a vytáhne hodnoty za 'Name:' a 'Team:'."""
-    name_match = re.search(r"^Name:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
-    team_match = re.search(r"^Team:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
-
-    if name_match and team_match:
-        return name_match.group(1).strip(), team_match.group(1).strip()
-    return None, None
+    logger.warning("Operace nebyla dokončena po %d pokusech, vracím poslední data.", OPERATION_POLL_ATTEMPTS)
+    return operation_data
 
 
 def extract_asset_id(result: dict) -> str | None:
-    """
-    Pokusí se extrahovat Asset ID z výsledku Roblox API.
-    Podporuje různé struktury odpovědi (done/response/assetId nebo přímé assetId).
-    """
-    # Struktura po dokončení operace: result["response"]["assetId"]
     asset_id = result.get("response", {}).get("assetId")
     if asset_id:
         return str(asset_id)
-
-    # Alternativní umístění přímo na vrchní úrovni
     asset_id = result.get("assetId")
     if asset_id:
         return str(asset_id)
-
-    # Někdy je zanořeno v "result"
     asset_id = result.get("result", {}).get("assetId")
     if asset_id:
         return str(asset_id)
-
     return None
 
 
 async def process_upload(
-    attachment: discord.Attachment,
+    file_bytes: bytes,
+    filename: str,
     audio_name: str,
     team_name: str,
     user: discord.abc.User,
 ) -> discord.Embed:
-    """Společná logika pro kontrolu souboru, nahrání na Roblox a zápis do tabulky."""
-    if not attachment.filename.lower().endswith(".mp3"):
-        raise ValueError("Přiložený soubor musí mít příponu `.mp3`!")
-
-    size_mb = attachment.size / (1024 * 1024)
-    if size_mb > MAX_FILE_SIZE_MB:
-        raise ValueError(f"Soubor je příliš velký ({size_mb:.2f} MB). Maximum je {MAX_FILE_SIZE_MB} MB.")
-
     logger.info("Zahajuji nahrávání: audio=%s, team=%s, user=%s", audio_name, team_name, user)
-    file_bytes = await attachment.read()
-    result = await upload_mp3_to_roblox(file_bytes, attachment.filename, audio_name, team_name, user.display_name)
+    result = await upload_mp3_to_roblox(file_bytes, filename, audio_name, team_name, user.display_name)
 
-    # Kontrola chyby přímo v odpovědi
     if "error" in result:
         raise Exception(f"Chyba z Robloxu: {json.dumps(result['error'])}")
 
@@ -249,6 +181,102 @@ async def process_upload(
     return embed
 
 
+def has_admin_role(member: discord.Member) -> bool:
+    if not ADMIN_ROLE_ID:
+        return True
+    return any(r.id == ADMIN_ROLE_ID for r in getattr(member, "roles", []))
+
+
+def has_ultras_role(member: discord.Member) -> bool:
+    if not ULTRAS_LEADER_ROLE_ID:
+        return True
+    return any(r.id == ULTRAS_LEADER_ROLE_ID for r in getattr(member, "roles", []))
+
+
+class ApprovalView(discord.ui.View):
+    def __init__(self, file_bytes: bytes, filename: str, audio_name: str, team_name: str, requester: discord.Member):
+        super().__init__(timeout=3600)
+        self.file_bytes = file_bytes
+        self.filename = filename
+        self.audio_name = audio_name
+        self.team_name = team_name
+        self.requester = requester
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not has_admin_role(interaction.user):
+            await interaction.response.send_message("❌ Pouze Admin může schvalovat requesty.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="✅ Přijmout", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        self.stop()
+        for child in self.children:
+            child.disabled = True
+
+        processing_embed = discord.Embed(
+            title="⏳ Nahrávám na Roblox...",
+            description=f"Request od **{self.requester.display_name}** byl přijat — nahrávám.",
+            color=discord.Color.yellow(),
+        )
+        await interaction.message.edit(embed=processing_embed, view=self)
+
+        try:
+            embed = await process_upload(
+                self.file_bytes, self.filename, self.audio_name, self.team_name, self.requester
+            )
+            embed.description = f"Schválil: {interaction.user.display_name}"
+            await interaction.message.edit(embed=embed, view=self)
+        except Exception as e:
+            logger.exception("Chyba při nahrávání po schválení")
+            err_embed = discord.Embed(title="❌ Chyba při nahrávání", description=str(e), color=discord.Color.red())
+            await interaction.message.edit(embed=err_embed, view=self)
+
+    @discord.ui.button(label="❌ Odmítnout", style=discord.ButtonStyle.danger)
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        self.stop()
+        for child in self.children:
+            child.disabled = True
+
+        reject_embed = discord.Embed(
+            title="❌ Request odmítnut",
+            color=discord.Color.red(),
+        )
+        reject_embed.add_field(name="Name", value=f"`{self.audio_name}`", inline=True)
+        reject_embed.add_field(name="Team", value=f"`{self.team_name}`", inline=True)
+        reject_embed.set_footer(text=f"Odmítl: {interaction.user.display_name} | Žádal: {self.requester.display_name}")
+        await interaction.message.edit(embed=reject_embed, view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+
+class AudioBot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        await self.tree.sync()
+        logger.info("Slash příkazy byly synchronizovány.")
+
+
+client = AudioBot()
+
+
+def parse_template(content: str):
+    name_match = re.search(r"^Name:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
+    team_match = re.search(r"^Team:\s*(.+)$", content, re.IGNORECASE | re.MULTILINE)
+    if name_match and team_match:
+        return name_match.group(1).strip(), team_match.group(1).strip()
+    return None, None
+
+
 @client.event
 async def on_ready():
     logger.info("Bot je online jako %s (ID: %s)", client.user, client.user.id)
@@ -259,7 +287,7 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    if ADMIN_ROLE_ID and not any(r.id == ADMIN_ROLE_ID for r in getattr(message.author, "roles", [])):
+    if not has_ultras_role(message.author):
         return
 
     if UPLOAD_CHANNEL_ID and message.channel.id != UPLOAD_CHANNEL_ID:
@@ -274,44 +302,69 @@ async def on_message(message: discord.Message):
         None,
     )
     if not mp3_attachment:
-        await message.reply(
-            "❌ Vyplnil jsi šablonu `Name:` a `Team:`, ale zapomněl jsi přiložit `.mp3` soubor!"
-        )
+        await message.reply("❌ Vyplnil jsi šablonu `Name:` a `Team:`, ale zapomněl jsi přiložit `.mp3` soubor!")
         return
 
-    status_msg = await message.reply(
-        f"⏳ Nahrávám `{audio_name}` pro tým **{team_name}** na Roblox a zapisuji do tabulky..."
+    size_mb = mp3_attachment.size / (1024 * 1024)
+    if size_mb > MAX_FILE_SIZE_MB:
+        await message.reply(f"❌ Soubor je příliš velký ({size_mb:.2f} MB). Maximum je {MAX_FILE_SIZE_MB} MB.")
+        return
+
+    if not mp3_attachment.filename.lower().endswith(".mp3"):
+        await message.reply("❌ Přiložený soubor musí mít příponu `.mp3`!")
+        return
+
+    file_bytes = await mp3_attachment.read()
+
+    pending_embed = discord.Embed(
+        title="⏳ Čeká na schválení",
+        color=discord.Color.orange(),
     )
+    pending_embed.add_field(name="Name", value=f"`{audio_name}`", inline=True)
+    pending_embed.add_field(name="Team", value=f"`{team_name}`", inline=True)
+    pending_embed.set_footer(text=f"Žádal: {message.author.display_name}", icon_url=message.author.display_avatar.url)
 
-    try:
-        embed = await process_upload(mp3_attachment, audio_name, team_name, message.author)
-        await status_msg.edit(content=None, embed=embed)
-    except ValueError as e:
-        await status_msg.edit(content=f"❌ **Chyba validace:** {str(e)}")
-    except Exception as e:
-        logger.exception("Neočekávaná chyba při zpracování nahrávky od %s", message.author)
-        await status_msg.edit(content=f"❌ **Chyba:** {str(e)}")
+    view = ApprovalView(file_bytes, mp3_attachment.filename, audio_name, team_name, message.author)
+    await message.reply(embed=pending_embed, view=view)
 
 
-@client.tree.command(name="upload", description="Nahraje MP3 na Roblox a zapíše Name a ID do tabulky týmu")
+@client.tree.command(name="upload", description="Pošle request na nahrání MP3 na Roblox (vyžaduje schválení Adminem)")
 @app_commands.describe(
     name="Name: Název audia",
     team="Team: Název týmu (vytvoří nebo najde záložku v Google Sheets)",
     mp3="Mp3: Přiložený .mp3 soubor"
 )
 async def upload_slash(interaction: discord.Interaction, name: str, team: str, mp3: discord.Attachment):
-    if ADMIN_ROLE_ID and not any(r.id == ADMIN_ROLE_ID for r in getattr(interaction.user, "roles", [])):
-        await interaction.response.send_message("❌ Nemáš oprávnění používat tento příkaz.", ephemeral=True)
+    if not has_ultras_role(interaction.user):
+        await interaction.response.send_message("❌ Pouze Ultras Leader může posílat requesty.", ephemeral=True)
         return
+
+    if not mp3.filename.lower().endswith(".mp3"):
+        await interaction.response.send_message("❌ Přiložený soubor musí mít příponu `.mp3`!", ephemeral=True)
+        return
+
+    size_mb = mp3.size / (1024 * 1024)
+    if size_mb > MAX_FILE_SIZE_MB:
+        await interaction.response.send_message(
+            f"❌ Soubor je příliš velký ({size_mb:.2f} MB). Maximum je {MAX_FILE_SIZE_MB} MB.", ephemeral=True
+        )
+        return
+
     await interaction.response.defer(thinking=True)
-    try:
-        embed = await process_upload(mp3, name, team, interaction.user)
-        await interaction.followup.send(embed=embed)
-    except ValueError as e:
-        await interaction.followup.send(f"❌ **Chyba validace:** {str(e)}")
-    except Exception as e:
-        logger.exception("Neočekávaná chyba při /upload od %s", interaction.user)
-        await interaction.followup.send(f"❌ **Chyba:** {str(e)}")
+    file_bytes = await mp3.read()
+
+    pending_embed = discord.Embed(
+        title="⏳ Čeká na schválení",
+        color=discord.Color.orange(),
+    )
+    pending_embed.add_field(name="Name", value=f"`{name}`", inline=True)
+    pending_embed.add_field(name="Team", value=f"`{team}`", inline=True)
+    pending_embed.set_footer(
+        text=f"Žádal: {interaction.user.display_name}", icon_url=interaction.user.display_avatar.url
+    )
+
+    view = ApprovalView(file_bytes, mp3.filename, name, team, interaction.user)
+    await interaction.followup.send(embed=pending_embed, view=view)
 
 
 if __name__ == "__main__":
