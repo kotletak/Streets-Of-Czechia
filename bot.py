@@ -26,6 +26,7 @@ ROBLOX_API_KEY = os.getenv("ROBLOX_API_KEY")
 ROBLOX_GROUP_ID = os.getenv("ROBLOX_GROUP_ID")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 CREDENTIALS_FILE = os.getenv("CREDENTIALS_FILE", "credentials.json")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 
 raw_channel_id = os.getenv("UPLOAD_CHANNEL_ID", "").strip()
 UPLOAD_CHANNEL_ID = int(raw_channel_id) if raw_channel_id.isdigit() else None
@@ -55,7 +56,10 @@ if missing_vars:
 
 
 def log_to_sheets_sync(team_name: str, audio_name: str, asset_id: str, uploader: str) -> str:
-    gc = gspread.service_account(filename=CREDENTIALS_FILE)
+    if GOOGLE_CREDENTIALS_JSON:
+        gc = gspread.service_account_from_dict(json.loads(GOOGLE_CREDENTIALS_JSON))
+    else:
+        gc = gspread.service_account(filename=CREDENTIALS_FILE)
     sh = gc.open_by_key(SPREADSHEET_ID)
 
     safe_team_name = re.sub(r'[\*\?\:\/\\\[\]]', '', team_name).strip()[:99]
