@@ -3,6 +3,7 @@ import re
 import json
 import asyncio
 import logging
+import tempfile
 import aiohttp
 import discord
 from discord import app_commands
@@ -42,6 +43,9 @@ MAX_FILE_SIZE_MB = float(os.getenv("MAX_FILE_SIZE_MB", "19.5"))
 OPERATION_POLL_ATTEMPTS = int(os.getenv("OPERATION_POLL_ATTEMPTS", "20"))
 OPERATION_POLL_INTERVAL = float(os.getenv("OPERATION_POLL_INTERVAL", "3"))
 
+PENDING_DIR = "pending_uploads"
+os.makedirs(PENDING_DIR, exist_ok=True)
+
 missing_vars = [
     var_name for var_name, val in [
         ("DISCORD_TOKEN", DISCORD_TOKEN),
@@ -53,6 +57,35 @@ missing_vars = [
 
 if missing_vars:
     raise RuntimeError(f"❌ V souboru .env chybí tyto povinné proměnné: {', '.join(missing_vars)}")
+
+
+def save_pending(message_id: int, data: dict, file_bytes: bytes):
+    base = os.path.join(PENDING_DIR, str(message_id))
+    with open(base + ".json", "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    with open(base + ".mp3", "wb") as f:
+        f.write(file_bytes)
+
+
+def load_pending(message_id: int) -> tuple[dict | None, bytes | None]:
+    base = os.path.join(PENDING_DIR, str(message_id))
+    try:
+        with open(base + ".json", encoding="utf-8") as f:
+            data = json.load(f)
+        with open(base + ".mp3", "rb") as f:
+            file_bytes = f.read()
+        return data, file_bytes
+    except FileNotFoundError:
+        return None, None
+
+
+def delete_pending(message_id: int):
+    base = os.path.join(PENDING_DIR, str(message_id))
+    for ext in (".json", ".mp3"):
+        try:
+            os.unlink(base + ext)
+        except OSError:
+            pass
 
 
 def log_to_sheets_sync(team_name: str, audio_name: str, asset_id: str, uploader: str) -> str:
@@ -197,14 +230,33 @@ def has_ultras_role(member: discord.Member) -> bool:
     return any(r.id == ULTRAS_LEADER_ROLE_ID for r in getattr(member, "roles", []))
 
 
+async def play_preview(voice_channel: discord.VoiceChannel, file_bytes: bytes):
+    tmp_path = None
+    vc = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        vc = await voice_channel.connect()
+        source = discord.FFmpegPCMAudio(tmp_path)
+        vc.play(source)
+        while vc.is_playing():
+            await asyncio.sleep(1)
+    except Exception as e:
+        logger.warning("Nelze přehrát preview: %s", e)
+    finally:
+        if vc and vc.is_connected():
+            await vc.disconnect()
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 class ApprovalView(discord.ui.View):
-    def __init__(self, file_bytes: bytes, filename: str, audio_name: str, team_name: str, requester: discord.Member):
-        super().__init__(timeout=3600)
-        self.file_bytes = file_bytes
-        self.filename = filename
-        self.audio_name = audio_name
-        self.team_name = team_name
-        self.requester = requester
+    def __init__(self):
+        super().__init__(timeout=None)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not has_admin_role(interaction.user):
@@ -212,60 +264,75 @@ class ApprovalView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="✅ Přijmout", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="✅ Přijmout", style=discord.ButtonStyle.success, custom_id="approve_upload")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
+
+        data, file_bytes = load_pending(interaction.message.id)
+        if data is None:
+            await interaction.message.edit(
+                embed=discord.Embed(
+                    title="❌ Data nenalezena",
+                    description="Soubor pro tento request již neexistuje (bot byl restartován a data nebyla zachována).",
+                    color=discord.Color.red(),
+                ),
+                view=None,
+            )
+            return
+
         self.stop()
         for child in self.children:
             child.disabled = True
 
         processing_embed = discord.Embed(
             title="⏳ Nahrávám na Roblox...",
-            description=f"Request od **{self.requester.display_name}** byl přijat — nahrávám.",
+            description=f"Request od **{data['requester_name']}** byl přijat — nahrávám.",
             color=discord.Color.yellow(),
         )
         await interaction.message.edit(embed=processing_embed, view=self)
 
         try:
-            embed = await process_upload(
-                self.file_bytes, self.filename, self.audio_name, self.team_name, self.requester
-            )
+            user = await interaction.client.fetch_user(data["requester_id"])
+            embed = await process_upload(file_bytes, data["filename"], data["audio_name"], data["team_name"], user)
             embed.description = f"Schválil: {interaction.user.display_name}"
+            delete_pending(interaction.message.id)
             await interaction.message.edit(embed=embed, view=self)
         except Exception as e:
             logger.exception("Chyba při nahrávání po schválení")
             err_embed = discord.Embed(title="❌ Chyba při nahrávání", description=str(e), color=discord.Color.red())
             await interaction.message.edit(embed=err_embed, view=self)
 
-    @discord.ui.button(label="❌ Odmítnout", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="❌ Odmítnout", style=discord.ButtonStyle.danger, custom_id="reject_upload")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
+
+        data, _ = load_pending(interaction.message.id)
         self.stop()
         for child in self.children:
             child.disabled = True
+        delete_pending(interaction.message.id)
 
-        reject_embed = discord.Embed(
-            title="❌ Request odmítnut",
-            color=discord.Color.red(),
-        )
-        reject_embed.add_field(name="Name", value=f"`{self.audio_name}`", inline=True)
-        reject_embed.add_field(name="Team", value=f"`{self.team_name}`", inline=True)
-        reject_embed.set_footer(text=f"Odmítl: {interaction.user.display_name} | Žádal: {self.requester.display_name}")
+        audio_name = data["audio_name"] if data else "?"
+        team_name = data["team_name"] if data else "?"
+        requester_name = data["requester_name"] if data else "?"
+
+        reject_embed = discord.Embed(title="❌ Request odmítnut", color=discord.Color.red())
+        reject_embed.add_field(name="Name", value=f"`{audio_name}`", inline=True)
+        reject_embed.add_field(name="Team", value=f"`{team_name}`", inline=True)
+        reject_embed.set_footer(text=f"Odmítl: {interaction.user.display_name} | Žádal: {requester_name}")
         await interaction.message.edit(embed=reject_embed, view=self)
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
 
 
 class AudioBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
+        intents.voice_states = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
+        self.add_view(ApprovalView())
         await self.tree.sync()
         logger.info("Slash příkazy byly synchronizovány.")
 
@@ -314,22 +381,27 @@ async def on_message(message: discord.Message):
         await message.reply(f"❌ Soubor je příliš velký ({size_mb:.2f} MB). Maximum je {MAX_FILE_SIZE_MB} MB.")
         return
 
-    if not mp3_attachment.filename.lower().endswith(".mp3"):
-        await message.reply("❌ Přiložený soubor musí mít příponu `.mp3`!")
-        return
-
     file_bytes = await mp3_attachment.read()
 
-    pending_embed = discord.Embed(
-        title="⏳ Čeká na schválení",
-        color=discord.Color.orange(),
-    )
+    pending_embed = discord.Embed(title="⏳ Čeká na schválení", color=discord.Color.orange())
     pending_embed.add_field(name="Name", value=f"`{audio_name}`", inline=True)
     pending_embed.add_field(name="Team", value=f"`{team_name}`", inline=True)
     pending_embed.set_footer(text=f"Žádal: {message.author.display_name}", icon_url=message.author.display_avatar.url)
 
-    view = ApprovalView(file_bytes, mp3_attachment.filename, audio_name, team_name, message.author)
-    await message.reply(embed=pending_embed, view=view)
+    view = ApprovalView()
+    reply = await message.reply(embed=pending_embed, view=view)
+
+    save_pending(reply.id, {
+        "audio_name": audio_name,
+        "team_name": team_name,
+        "filename": mp3_attachment.filename,
+        "requester_id": message.author.id,
+        "requester_name": message.author.display_name,
+    }, file_bytes)
+
+    voice_state = message.author.voice
+    if voice_state and voice_state.channel:
+        asyncio.create_task(play_preview(voice_state.channel, file_bytes))
 
 
 @client.tree.command(name="upload", description="Pošle request na nahrání MP3 na Roblox (vyžaduje schválení Adminem)")
@@ -357,18 +429,27 @@ async def upload_slash(interaction: discord.Interaction, name: str, team: str, m
     await interaction.response.defer(thinking=True)
     file_bytes = await mp3.read()
 
-    pending_embed = discord.Embed(
-        title="⏳ Čeká na schválení",
-        color=discord.Color.orange(),
-    )
+    pending_embed = discord.Embed(title="⏳ Čeká na schválení", color=discord.Color.orange())
     pending_embed.add_field(name="Name", value=f"`{name}`", inline=True)
     pending_embed.add_field(name="Team", value=f"`{team}`", inline=True)
     pending_embed.set_footer(
         text=f"Žádal: {interaction.user.display_name}", icon_url=interaction.user.display_avatar.url
     )
 
-    view = ApprovalView(file_bytes, mp3.filename, name, team, interaction.user)
-    await interaction.followup.send(embed=pending_embed, view=view)
+    view = ApprovalView()
+    msg = await interaction.followup.send(embed=pending_embed, view=view, wait=True)
+
+    save_pending(msg.id, {
+        "audio_name": name,
+        "team_name": team,
+        "filename": mp3.filename,
+        "requester_id": interaction.user.id,
+        "requester_name": interaction.user.display_name,
+    }, file_bytes)
+
+    voice_state = interaction.user.voice
+    if voice_state and voice_state.channel:
+        asyncio.create_task(play_preview(voice_state.channel, file_bytes))
 
 
 if __name__ == "__main__":
